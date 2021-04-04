@@ -1,0 +1,21 @@
+{
+    "baseUrl": "http://localhost:8090/v1/exame/",
+    "reporter": "cypress-mochawesome-reporter",
+    "reporterOptions": {
+      "reportDir": "cypress/reports",
+      "reportFilename": "PDC",
+      "reportTitle": "integracao-dataprovider-api-tests - V1.0.0",
+      "reportPageTitle": "report",
+      "takePassedScreenshot": false,
+      "clearOldScreenshots": false,
+      "shortScrFileNames": false,
+      "inline": true,
+      "charts": true,
+      "autoOpen": true,
+      "jsonReport": true,
+      "multiReport": true,
+      "timestamp": "dd-mm-yyyy_HH-MM-ss",
+      "capture": "runner"
+    }
+  }
+  

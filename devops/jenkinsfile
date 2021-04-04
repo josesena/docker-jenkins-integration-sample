@@ -1,0 +1,152 @@
+pipeline {
+    agent { node { label 'linux && jdk11' }}
+
+    environment {
+        PROJECT_NAME="integracao-dataprovider-api"
+        VERSION="0.0.1"
+        REVISION="${env.BUILD_NUMBER}"
+        SLACK_CHANNEL="#portal-cadastro"
+
+        // Azure e Registry
+        AZURE_APP_ID = credentials('azureAppId ')
+        AZURE_APP_PASS = credentials('azureAppPass ')
+        DOCKER_USER_LOGIN = credentials('DOCKER_USER_LOGIN ')
+        DOCKER_USER_PASS = credentials('DOCKER_USER_PASS ') 
+
+        // Sonar e Fortify
+        SONAR_TOKEN = credentials('sonar_token')
+        DASA_FORTIFY_TOKEN=credentials('dasa_fortify_token') 
+                  
+        TYPE_COMPILE_LANG="mvn"                     //options: mvn / gradlew / npm / bar / python / php.  Ref: https://bitbucket.org/dasa_desenv/sec-fortify/src/master/bin/languages.reference
+        DASA_FORTIFY_PRODUCT = "Portal Cadastro"    //preencher de acordo com o cadastrado no Fortify. Ref: https://bitbucket.org/dasa_desenv/sec-fortify/src/master/bin/projects.reference
+        DASA_FORTIFY_VERSION = "1.0.0"              //manter 1.0.0
+
+        // Kubernetes
+        // Se quiser deployar na Azure use essas vars:
+        KUBECONFIG_DEV = credentials('kubeconfig_dev')        
+        KUBECONFIG_HML = credentials('kubeconfig_hml')
+        KUBECONFIG_PRD = credentials('kubeconfig_prd01')
+
+        PATH = "/opt/sonar-scanner-3.3.0.1492-linux/bin:$PATH"    // necessário para achar o Sonar, vamos acertar isso nos agentes
+    }
+    
+    // Sempre incluir esse step de options/timeout para não "prender" o agente do Jenkins infinitamente
+    options {
+        timeout(time: 1, unit: 'HOURS')
+    }
+
+    stages {
+        stage('Slack Message - START') {
+            steps {
+                slackSend (color: '#BADA55', message: "Starting build  ${env.BUILD_URL}", channel: "'$SLACK_CHANNEL'")
+            }
+        }
+        
+        // Checando o ambiente de acordo com a branch (Validar forma de seguir com o gitflow)
+        stage('Get Stage') {
+            steps {
+                script{
+                    env.ENVIRONMENT = "" 
+                    env.KUBECONFIG = ""
+
+                    if (env.GIT_BRANCH ==~ /.*develop/) {
+                        env.ENVIRONMENT = "dev" 
+                        env.KUBECONFIG =  "${env.KUBECONFIG_DEV}"
+                    } else if (env.GIT_BRANCH ==~ /.*stage/) {
+                        env.ENVIRONMENT = "hml"
+                        env.KUBECONFIG =  "${env.KUBECONFIG_HML}"
+                    } else if (env.GIT_BRANCH ==~ /.*master/) {
+                        env.ENVIRONMENT = "prd"
+                        env.KUBECONFIG =  "${env.KUBECONFIG_PRD}"
+                    }else{
+                        currentBuild.result = 'ABORTED'
+                        error('Pipe nao roda para outras branches. Necessário implementar')
+                    }
+
+                    env.IMAGE_VERSION = "$DOCKER_REPOSITORY/$ENVIRONMENT/$PROJECT_NAME:$VERSION-$REVISION "
+                    sh  '''echo Environment = $ENVIRONMENT'''
+                }
+            }
+        }                                    
+
+        stage('Build App') {
+            steps {
+                sh '''mvn clean install -DskipTests'''
+            }
+        }
+
+        stage('AZ login') {
+            steps {
+                sh '''az login -u $AZURE_APP_ID -p $AZURE_APP_PASS --service-principal --tenant $AZURE_TENANT_ID
+                      az acr login --name imagesdasa'''
+            }
+        } 
+
+        stage('Build & Tag Image') {
+            steps {
+                sh '''docker build -t  $IMAGE_VERSION .  --build-arg PROJECT_NAME=$PROJECT_NAME \
+                      --build-arg VERSION=$VERSION --build-arg REVISION=$REVISION --build-arg ENVIRONMENT=$ENVIRONMENT'''
+            }
+        }        
+
+        stage('Scan Fortify') {
+            steps {
+                checkout([$class: 'GitSCM', branches: [[name: '*/master']], doGenerateSubmoduleConfigurations: false, extensions: [[$class: 'RelativeTargetDirectory', relativeTargetDir: 'devops/fortify']], submoduleCfg: [], userRemoteConfigs: [[url: 'git@bitbucket.org:dasa_desenv/sec-fortify.git']]])
+                sh "$WORKSPACE/devops/fortify/fortify.sh -q"
+            }
+        }      
+
+        stage('Scan SonarQube') {
+            steps {
+                sh ' sonar-scanner -Dsonar.projectKey=$PROJECT_NAME$ENVIRONMENT -Dsonar.projectName=$PROJECT_NAME$ENVIRONMENT -Dsonar.projectVersion=$VERSION-$REVISION \
+                        -Dsonar.host.url=$SONAR_URL -Dsonar.token=$SONAR_TOKEN -Dsonar.sourceEncoding=UTF-8 \
+                        -Dsonar.verbose=true -Dsonar.java.libraries=/home/jenkins/.m2/repository/org/projectlombok/lombok/1.18.4/lombok-1.18.4.jar \
+                        -Dsonar.java.binaries=build/classes -Dsonar.sources=src/main -Dsonar.tests=src/test -Dsonar.junit.reportsPath=build/tests/test \
+                        -Dsonar.jacoco.reportPath=build/jacoco/test.exec -Dsonar.java.coveragePlugin=jacoco'
+            }
+        }   
+
+        stage('Upload to Registry') {
+            steps {
+                sh '''docker push $IMAGE_VERSION'''
+            }
+        }
+
+        stage('Tag Code') {
+            steps {
+                sh '''git tag -a $ENVIRONMENT/v$VERSION-$REVISION -m  "created by Jenkins pipeline - $ENVIRONMENT/v$VERSION-$REVISION"
+                      git push origin $ENVIRONMENT/v$VERSION-$REVISION'''
+            }
+        }
+        
+        stage('Report Fortify') {
+            steps {
+				script {
+					REPORT_FORTIFY = sh(returnStdout: true, script: "$WORKSPACE/devops/fortify/fortify.sh -r")
+					echo "$REPORT_FORTIFY"
+					 if (!REPORT_FORTIFY.contains("0 Críticas (Novas)")){
+						echo "Fortify doesn't meet criteria."
+						currentBuild.result = 'FAILURE'
+						slackSend (color: '#FF0000', message: "Error on build  ${env.BUILD_URL} due to critical security issues", channel: '#devsecops')
+					}
+				}
+            }
+        }
+
+        stage('Deploy') {
+            steps {
+                sh '''sed 's| \${IMAGE_VERSION}| '"${IMAGE_VERSION}"'|g' -i ./devops/$PROJECT_NAME-$ENVIRONMENT.yaml
+
+                      cat ./devops/$PROJECT_NAME-$ENVIRONMENT.yaml
+
+                      kubectl apply --kubeconfig=$KUBECONFIG -f ./devops/$PROJECT_NAME-$ENVIRONMENT.yaml'''                        
+            }
+        }                          
+
+        stage('Slack Message - END') {
+            steps {
+                slackSend (color: '#BADA55', message: "End of build  ${env.BUILD_URL}", channel: "'$SLACK_CHANNEL'")
+            }
+        }
+    }
+}
